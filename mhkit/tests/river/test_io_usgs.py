@@ -6,6 +6,8 @@ import unittest
 import os
 from unittest.mock import patch, MagicMock
 import json
+import warnings
+import requests
 import shutil
 from datetime import timezone
 
@@ -224,6 +226,101 @@ class TestUSGSRequest(unittest.TestCase):
             for _, kwargs in mock_get.call_args_list:
                 self.assertEqual(kwargs["headers"]["X-Api-Key"], "option-key")
                 self.assertNotIn("api_key", kwargs["params"])
+
+    @patch("mhkit.river.io.usgs.requests.get")
+    def test_request_usgs_data_legacy(self, mock_get):
+        payload = {
+            "value": {
+                "timeSeries": [
+                    {
+                        "variable": {
+                            "variableDescription": "Discharge, cubic feet per second"
+                        },
+                        "values": [
+                            {
+                                "value": [
+                                    {
+                                        "dateTime": "2009-08-01T00:00:00.000",
+                                        "value": "1000",
+                                        "qualifiers": ["A"],
+                                    }
+                                ]
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+        with self.assertWarns(DeprecationWarning):
+            data = self._request(
+                mock_get,
+                [_mock_response(payload)],
+                {"use_legacy_api": True, "data_type": "Instantaneous"},
+            )
+
+        _, kwargs = mock_get.call_args_list[-1]
+        self.assertEqual(kwargs["url"], "https://waterservices.usgs.gov/nwis/iv/")
+        self.assertEqual(kwargs["params"]["sites"], "15515500")
+        self.assertEqual(list(data.columns), ["Discharge, cubic feet per second"])
+        self.assertEqual(len(data), 1)
+
+    def test_request_usgs_data_legacy_unsupported_options(self):
+        for options in ({"include_status": True}, {"timezone": "America/Anchorage"}):
+            with self.assertRaises(ValueError):
+                river.io.usgs.request_usgs_data(
+                    "15515500",
+                    "00060",
+                    "2009-08-01",
+                    "2009-08-10",
+                    options={"use_legacy_api": True, **options},
+                )
+
+
+class TestUSGSParity(unittest.TestCase):
+    """
+    Compares the OGC Water Data APIs against the legacy WaterServices using the
+    live services. Skipped if either service is unavailable. Remove with the
+    use_legacy_api option.
+    """
+
+    def _compare(self, start, end, options, ogc_options=None):
+        options = {"clear_cache": True, **options}
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                legacy = river.io.usgs.request_usgs_data(
+                    "15515500",
+                    "00060",
+                    start,
+                    end,
+                    options={
+                        "use_legacy_api": True,
+                        **options,
+                    },
+                )
+            ogc = river.io.usgs.request_usgs_data(
+                "15515500",
+                "00060",
+                start,
+                end,
+                options={**options, **(ogc_options or {})},
+            )
+        except (requests.exceptions.RequestException, ValueError) as e:
+            self.skipTest(f"USGS service unavailable: {e}")
+
+        pd.testing.assert_frame_equal(ogc, legacy, check_freq=False)
+
+    def test_parity_daily(self):
+        self._compare("2009-08-01", "2009-08-31", {"data_type": "Daily"})
+
+    def test_parity_instantaneous(self):
+        # Legacy instantaneous dates are station local days (Alaska)
+        self._compare(
+            "2009-08-01",
+            "2009-08-03",
+            {"data_type": "Instantaneous"},
+            ogc_options={"timezone": "America/Anchorage"},
+        )
 
 
 if __name__ == "__main__":
